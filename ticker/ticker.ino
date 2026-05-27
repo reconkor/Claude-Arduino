@@ -1,3 +1,5 @@
+#define FIRMWARE_VERSION "1.0.0"
+
 // 기본 종목 목록 (NVS 비어있을 때만 사용)
 const char* DEFAULT_TICKERS = "AAPL,NVDA,TSLA,COIN:BTC,COIN:ETH,COIN:SOL";
 const int MAX_TICKERS = 20;
@@ -21,6 +23,8 @@ const int PERIOD_COUNT = sizeof(PERIODS) / sizeof(PERIODS[0]);
 
 int chartPeriodIdx = 0;           // 기본 1D
 unsigned long switchMs = 5000;    // 기본 5초
+unsigned long dataRefreshMs = 300000; // 기본 5분
+unsigned long lastDataRefresh = 0;
 
 // FS.h를 먼저 포함하고 전역 네임스페이스로 올려야
 // ESP32 core 3.3.8의 WebServer.h와 충돌하지 않음
@@ -37,6 +41,8 @@ using fs::FS;
 #include <BLEDevice.h>
 #include <BLEServer.h>
 #include <BLEUtils.h>
+#include <HTTPUpdate.h>
+#include <WiFiClientSecure.h>
 
 String tickers[MAX_TICKERS];
 int tickerCount = 0;
@@ -52,6 +58,7 @@ const int MAX_CHART_POINTS = 60;
 struct TickerData {
   char symbol[16];
   float price;
+  float prevClose;
   float change;
   bool valid;
   AssetType type;
@@ -60,6 +67,38 @@ struct TickerData {
   float chartMin;
   float chartMax;
 };
+
+// 한국 주식 코드 → 기업명 매핑
+struct KrCompany { const char* code; const char* name; };
+const KrCompany KR_COMPANIES[] = {
+  {"005930", "Samsung"},
+  {"000660", "SK Hynix"},
+  {"035720", "Kakao"},
+  {"005380", "Hyundai"},
+  {"051910", "LG Chem"},
+  {"035420", "Naver"},
+  {"006400", "Samsung SDI"},
+  {"066570", "LG Elec"},
+  {"105560", "KB Fin"},
+  {"055550", "Shinhan"},
+  {"096770", "SK Inno"},
+  {"003550", "LG Corp"},
+  {"017670", "SK Telecom"},
+  {"030200", "KT"},
+  {"000270", "Kia"},
+  {"005490", "POSCO"},
+  {"012330", "H.Mobis"},
+  {"032830", "Samsung Li"},
+  {"086790", "Hana Fin"},
+  {"028260", "Samsung CT"},
+};
+const int KR_COMPANY_COUNT = sizeof(KR_COMPANIES) / sizeof(KR_COMPANIES[0]);
+
+const char* krCompanyName(const char* code) {
+  for (int i = 0; i < KR_COMPANY_COUNT; i++)
+    if (strcmp(code, KR_COMPANIES[i].code) == 0) return KR_COMPANIES[i].name;
+  return code;
+}
 
 // ── 컬러 팔레트 ───────────────────────────────────────
 #define COL_BG       TFT_BLACK
@@ -77,6 +116,9 @@ int currentIndex = 0;
 unsigned long lastRefresh = 0;
 char finnhubKey[64] = "";
 volatile bool bleConnected = false;
+char otaUrl[128] = "";           // e.g. http://192.168.1.10/firmware
+unsigned long lastOtaCheck = 0;
+const unsigned long OTA_CHECK_INTERVAL = 3600000UL; // 1시간
 
 // ── WiFiManager ───────────────────────────────────────
 WiFiManager wm;
@@ -87,6 +129,93 @@ void saveParamCallback() {
   prefs.begin("ticker", false);
   prefs.putString("finnhub_key", finnhubKey);
   prefs.end();
+}
+
+// ── OTA ──────────────────────────────────────────────
+void drawOtaScreen(int pct, const char* msg) {
+  tft.fillScreen(COL_BG);
+  tft.fillRoundRect(10, 6, 80, 20, 4, COL_STOCK);
+  tft.setTextFont(2); tft.setTextSize(1);
+  tft.setTextColor(COL_BG, COL_STOCK);
+  tft.setCursor(18, 9); tft.print("UPDATING");
+
+  tft.setTextFont(4); tft.setTextSize(1);
+  tft.setTextColor(COL_TEXT, COL_BG);
+  char buf[24]; snprintf(buf, sizeof(buf), "%d%%", pct);
+  int w = tft.textWidth(buf);
+  tft.setCursor((320 - w) / 2, 55); tft.print(buf);
+
+  // 진행바
+  int barW = 280, barH = 12, barX = 20, barY = 90;
+  tft.drawRect(barX, barY, barW, barH, COL_DIM);
+  tft.fillRect(barX + 1, barY + 1, (barW - 2) * pct / 100, barH - 2, COL_STOCK);
+
+  tft.setTextFont(2); tft.setTextSize(1);
+  tft.setTextColor(COL_DIM, COL_BG);
+  int mw = tft.textWidth(msg);
+  tft.setCursor((320 - mw) / 2, 115); tft.print(msg);
+}
+
+void checkOtaUpdate() {
+  if (strlen(otaUrl) == 0) return;
+
+  String base = String(otaUrl);
+  if (!base.endsWith("/")) base += "/";
+  String versionUrl = base + "version.txt";
+  String firmwareUrl = base + "firmware.bin";
+  bool isHttps = base.startsWith("https");
+
+  Serial.printf("[OTA] Checking %s\n", versionUrl.c_str());
+
+  // version.txt 확인
+  HTTPClient http;
+  http.setTimeout(8000);
+  if (isHttps) {
+    static WiFiClientSecure sc;
+    sc.setInsecure();
+    http.begin(sc, versionUrl);
+  } else {
+    http.begin(versionUrl);
+  }
+  int code = http.GET();
+  if (code != 200) {
+    Serial.printf("[OTA] version.txt HTTP %d\n", code);
+    http.end(); return;
+  }
+  String remoteVer = http.getString();
+  remoteVer.trim();
+  http.end();
+
+  Serial.printf("[OTA] remote=%s local=%s\n", remoteVer.c_str(), FIRMWARE_VERSION);
+  if (remoteVer == FIRMWARE_VERSION) return;
+
+  // 새 버전 발견 → 다운로드 & 플래시
+  String label = "v" + String(FIRMWARE_VERSION) + " -> v" + remoteVer;
+  drawOtaScreen(0, label.c_str());
+
+  httpUpdate.onProgress([](int cur, int total) {
+    if (total > 0) drawOtaScreen(cur * 100 / total, "Downloading...");
+  });
+
+  t_httpUpdate_return ret;
+  if (isHttps) {
+    static WiFiClientSecure sc2;
+    sc2.setInsecure();
+    ret = httpUpdate.update(sc2, firmwareUrl);
+  } else {
+    WiFiClient plain;
+    ret = httpUpdate.update(plain, firmwareUrl);
+  }
+
+  switch (ret) {
+    case HTTP_UPDATE_OK:
+      drawOtaScreen(100, "Done! Restarting...");
+      delay(1500); ESP.restart(); break;
+    case HTTP_UPDATE_FAILED:
+      Serial.printf("[OTA] Failed: %s\n", httpUpdate.getLastErrorString().c_str());
+      break;
+    default: break;
+  }
 }
 
 void drawSetupScreen() {
@@ -194,6 +323,11 @@ void loadSettings() {
   switchMs = prefs.getULong("switch_ms", 5000);
   if (switchMs < 2000) switchMs = 2000;
   if (switchMs > 60000) switchMs = 60000;
+  dataRefreshMs = prefs.getULong("refresh_ms", 300000);
+  if (dataRefreshMs < 60000) dataRefreshMs = 60000;
+  if (dataRefreshMs > 3600000) dataRefreshMs = 3600000;
+  String savedOta = prefs.getString("ota_url", "");
+  strncpy(otaUrl, savedOta.c_str(), sizeof(otaUrl) - 1);
   prefs.end();
 }
 
@@ -201,6 +335,8 @@ void saveSettings() {
   prefs.begin("ticker", false);
   prefs.putInt("period", chartPeriodIdx);
   prefs.putULong("switch_ms", switchMs);
+  prefs.putULong("refresh_ms", dataRefreshMs);
+  prefs.putString("ota_url", otaUrl);
   prefs.end();
 }
 
@@ -218,68 +354,55 @@ String htmlEscape(const String& s) {
   return r;
 }
 
+static const char* COMMON_CSS =
+  "body{font-family:-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;"
+  "max-width:480px;margin:0 auto;padding:0 16px 32px;background:#111;color:#eee;}"
+  ".topbar{display:flex;align-items:center;padding:16px 0 4px;}"
+  ".topbar h1{flex:1;font-size:20px;margin:0;}"
+  ".icon-btn{background:none;border:none;color:#888;font-size:22px;cursor:pointer;"
+  "padding:4px 8px;border-radius:6px;text-decoration:none;line-height:1;}"
+  ".icon-btn:hover{background:#222;color:#eee;}"
+  ".sub{color:#888;font-size:13px;margin-bottom:16px;}"
+  ".item{display:flex;align-items:center;padding:12px;background:#1e1e1e;"
+  "border-radius:8px;margin-bottom:6px;}"
+  ".sym{flex:1;font-weight:600;font-size:15px;}"
+  ".tag{font-size:10px;padding:3px 8px;border-radius:10px;margin-right:10px;"
+  "color:#000;font-weight:700;letter-spacing:0.5px;}"
+  ".stock{background:#5b9bd5;}.crypto{background:#f6ad3d;}.kstock{background:#c454f0;}"
+  "form{display:inline;margin:0;}"
+  "button{padding:6px 12px;border:none;border-radius:6px;cursor:pointer;font-size:13px;}"
+  ".del{background:transparent;color:#e57373;border:1px solid #444;}"
+  ".del:hover{background:#e34c4c;color:#fff;border-color:#e34c4c;}"
+  ".card{margin-top:20px;padding:16px;background:#1e1e1e;border-radius:8px;}"
+  ".card h2{font-size:13px;color:#888;margin:0 0 14px;text-transform:uppercase;letter-spacing:1px;}"
+  ".row{display:flex;gap:8px;}"
+  ".label{font-size:12px;color:#888;margin-bottom:6px;}"
+  "select,input[type=text],input[type=number],input[type=file]{"
+  "padding:10px;background:#2a2a2a;color:#fff;border:1px solid #444;"
+  "border-radius:6px;font-size:14px;}"
+  "input[type=text],input[type=number]{flex:1;}"
+  ".addbtn{background:#3666e6;color:#fff;padding:10px 20px;font-weight:600;}"
+  ".empty{padding:20px;text-align:center;color:#666;font-style:italic;}"
+  ".divider{border:none;border-top:1px solid #2a2a2a;margin:16px 0;}"
+  ".wide-btn{width:100%;padding:11px;background:#2a2a2a;color:#aaa;"
+  "border:1px solid #444;border-radius:6px;cursor:pointer;font-size:13px;margin-top:10px;}";
+
 void handleRoot() {
   String html =
     "<!DOCTYPE html><html><head>"
     "<meta charset='utf-8'>"
     "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-    "<title>Ticker Settings</title>"
-    "<style>"
-    "body{font-family:-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;"
-    "max-width:480px;margin:0 auto;padding:20px 16px;background:#111;color:#eee;}"
-    "h1{font-size:22px;margin:0 0 4px;}"
-    ".sub{color:#888;font-size:13px;margin-bottom:20px;}"
-    ".item{display:flex;align-items:center;padding:12px;background:#1e1e1e;"
-    "border-radius:8px;margin-bottom:6px;}"
-    ".sym{flex:1;font-weight:600;font-size:15px;}"
-    ".tag{font-size:10px;padding:3px 8px;border-radius:10px;margin-right:10px;"
-    "color:#000;font-weight:700;letter-spacing:0.5px;}"
-    ".stock{background:#5b9bd5;} .crypto{background:#f6ad3d;} .kstock{background:#c454f0;}"
-    "form{display:inline;margin:0;}"
-    "button{padding:6px 12px;border:none;border-radius:6px;cursor:pointer;font-size:13px;}"
-    ".del{background:transparent;color:#e57373;border:1px solid #444;}"
-    ".del:hover{background:#e34c4c;color:#fff;border-color:#e34c4c;}"
-    ".add{margin-top:24px;padding:16px;background:#1e1e1e;border-radius:8px;}"
-    ".add h2{font-size:14px;color:#888;margin:0 0 12px;text-transform:uppercase;letter-spacing:1px;}"
-    ".row{display:flex;gap:8px;}"
-    "select,input{padding:10px;background:#2a2a2a;color:#fff;border:1px solid #444;"
-    "border-radius:6px;font-size:14px;}"
-    "input{flex:1;}"
-    ".addbtn{background:#3666e6;color:#fff;padding:10px 20px;font-weight:600;}"
-    ".empty{padding:20px;text-align:center;color:#666;font-style:italic;}"
-    "</style></head><body>"
-    "<h1>Ticker Settings</h1>"
-    "<div class='sub'>"; html += String(tickerCount) + " / " + String(MAX_TICKERS) + " configured</div>";
+    "<title>Ticker</title>"
+    "<style>"; html += COMMON_CSS; html += "</style></head><body>";
 
-  // ── Display Settings 섹션 ──────────────────────────
-  html += "<div class='add' style='margin-top:0;margin-bottom:24px;'>"
-          "<h2>Display Settings</h2>"
-          "<form method='POST' action='/settings'>"
-          "<div style='display:flex;flex-direction:column;gap:12px;'>"
-          "<div><div style='font-size:12px;color:#888;margin-bottom:6px;'>Chart Period</div>"
-          "<div style='display:flex;gap:6px;'>";
-  for (int i = 0; i < PERIOD_COUNT; i++) {
-    bool sel = (i == chartPeriodIdx);
-    html += "<button type='submit' name='period' value='" + String(i) +
-            "' style='flex:1;padding:10px;border-radius:6px;border:1px solid #444;"
-            "background:" + String(sel ? "#3666e6" : "#2a2a2a") +
-            ";color:" + String(sel ? "#fff" : "#aaa") +
-            ";font-weight:" + String(sel ? "600" : "400") + ";'>";
-    html += PERIODS[i].label;
-    html += "</button>";
-  }
-  html += "</div></div>";
+  // ── 헤더 ──────────────────────────────────────────
+  html += "<div class='topbar'>"
+          "<h1>Ticker</h1>"
+          "<a href='/config' class='icon-btn' title='Settings'>&#9881;</a>"
+          "</div>"
+          "<div class='sub'>" + String(tickerCount) + " / " + String(MAX_TICKERS) + " tickers</div>";
 
-  html += "<div><div style='font-size:12px;color:#888;margin-bottom:6px;'>"
-          "Switch Interval (seconds)</div>"
-          "<div style='display:flex;gap:8px;'>"
-          "<input type='number' name='interval' min='2' max='60' value='" +
-          String(switchMs / 1000) + "' style='flex:1;'>"
-          "<button type='submit' name='save_interval' value='1' class='addbtn'>Save</button>"
-          "</div></div>"
-          "</div></form></div>";
-
-
+  // ── 종목 목록 ─────────────────────────────────────
   if (tickerCount == 0) {
     html += "<div class='empty'>No tickers. Add one below.</div>";
   } else {
@@ -290,36 +413,113 @@ void handleRoot() {
         display = tickers[i].substring(5);
         tagClass = "crypto"; tagText = "CRYPTO";
       } else if (tickers[i].startsWith("KR:")) {
-        display = tickers[i].substring(3);
+        String code = tickers[i].substring(3);
+        const char* name = krCompanyName(code.c_str());
+        display = (name != code.c_str()) ? String(name) + " (" + code + ")" : code;
         tagClass = "kstock"; tagText = "K-STOCK";
       } else {
         tagClass = "stock"; tagText = "STOCK";
       }
-      html += "<div class='item'>";
-      html += "<span class='tag " + tagClass + "'>" + tagText + "</span>";
-      html += "<span class='sym'>" + htmlEscape(display) + "</span>";
-      html += "<form method='POST' action='/delete'>";
-      html += "<input type='hidden' name='idx' value='" + String(i) + "'>";
-      html += "<button class='del'>Remove</button></form>";
-      html += "</div>";
+      html += "<div class='item'>"
+              "<span class='tag " + tagClass + "'>" + tagText + "</span>"
+              "<span class='sym'>" + htmlEscape(display) + "</span>"
+              "<form method='POST' action='/delete'>"
+              "<input type='hidden' name='idx' value='" + String(i) + "'>"
+              "<button class='del'>Remove</button></form>"
+              "</div>";
     }
   }
 
-  html +=
-    "<div class='add'><h2>Add Ticker</h2>"
-    "<form method='POST' action='/add'><div class='row'>"
-    "<select name='type'>"
-    "<option value='stock'>STOCK (US)</option>"
-    "<option value='crypto'>CRYPTO</option>"
-    "<option value='kstock'>K-STOCK</option>"
-    "</select>"
-    "<input name='symbol' placeholder='AAPL / BTC / 005930' maxlength='10' required autocapitalize='characters'>"
-    "<button class='addbtn'>Add</button>"
-    "</div></form></div>"
-    "<p style='color:#666;font-size:12px;margin-top:24px;text-align:center;line-height:1.6;'>"
-    "Crypto: BTC, ETH, SOL, BNB, XRP, DOGE<br>"
-    "K-Stock: 005930 (Samsung), 000660 (SK Hynix), 035720 (Kakao)</p>"
-    "</body></html>";
+  // ── 종목 추가 ─────────────────────────────────────
+  html += "<div class='card'><h2>Add Ticker</h2>"
+          "<form method='POST' action='/add'><div class='row'>"
+          "<select name='type'>"
+          "<option value='stock'>STOCK (US)</option>"
+          "<option value='crypto'>CRYPTO</option>"
+          "<option value='kstock'>K-STOCK</option>"
+          "</select>"
+          "<input type='text' name='symbol' placeholder='AAPL / BTC / 005930'"
+          " maxlength='10' required autocapitalize='characters'>"
+          "<button class='addbtn'>Add</button>"
+          "</div></form></div>"
+          "<p style='color:#555;font-size:12px;margin-top:20px;text-align:center;line-height:1.7;'>"
+          "Crypto: BTC, ETH, SOL, BNB, XRP, DOGE<br>"
+          "K-Stock: 005930 (Samsung), 000660 (SK Hynix)</p>"
+          "</body></html>";
+
+  webServer.send(200, "text/html", html);
+}
+
+void handleConfig() {
+  String html =
+    "<!DOCTYPE html><html><head>"
+    "<meta charset='utf-8'>"
+    "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+    "<title>Settings</title>"
+    "<style>"; html += COMMON_CSS; html += "</style></head><body>";
+
+  // ── 헤더 ──────────────────────────────────────────
+  html += "<div class='topbar'>"
+          "<a href='/' class='icon-btn' title='Back'>&#8592;</a>"
+          "<h1 style='text-align:center;'>Settings</h1>"
+          "<span style='width:38px;'></span>"
+          "</div>";
+
+  // ── 디스플레이 설정 ───────────────────────────────
+  html += "<div class='card'><h2>Display</h2>"
+          "<form method='POST' action='/settings'>"
+          "<div style='display:flex;flex-direction:column;gap:14px;'>"
+          "<div><div class='label'>Chart Period</div>"
+          "<div style='display:flex;gap:6px;'>";
+  for (int i = 0; i < PERIOD_COUNT; i++) {
+    bool sel = (i == chartPeriodIdx);
+    html += "<button type='submit' name='period' value='" + String(i) +
+            "' style='flex:1;padding:10px;border-radius:6px;border:1px solid #444;"
+            "background:" + String(sel ? "#3666e6" : "#2a2a2a") +
+            ";color:" + String(sel ? "#fff" : "#aaa") +
+            ";font-weight:" + String(sel ? "600" : "400") + ";'>"
+            + PERIODS[i].label + "</button>";
+  }
+  html += "</div></div>"
+          "<div><div class='label'>Switch Interval (seconds)</div>"
+          "<div class='row'>"
+          "<input type='number' name='interval' min='2' max='60' value='" + String(switchMs / 1000) + "'>"
+          "<button type='submit' name='save_interval' value='1' class='addbtn'>Save</button>"
+          "</div></div>"
+          "<div><div class='label'>Auto-Refresh Interval (minutes)</div>"
+          "<div class='row'>"
+          "<input type='number' name='refresh_min' min='1' max='60' value='" + String(dataRefreshMs / 60000) + "'>"
+          "<button type='submit' name='save_refresh' value='1' class='addbtn'>Save</button>"
+          "</div></div>"
+          "</div></form></div>";
+
+  // ── 펌웨어 업데이트 ───────────────────────────────
+  html += "<div class='card'><h2>Firmware Update</h2>"
+          "<div class='label'>Current version: <b style='color:#eee;'>v" FIRMWARE_VERSION "</b></div>"
+          "<hr class='divider'>"
+          "<div class='label'>Auto Update — Server URL</div>"
+          "<form method='POST' action='/ota'>"
+          "<div class='row'>"
+          "<input type='text' name='ota_url' placeholder='http://192.168.1.x/firmware' value='" +
+          htmlEscape(String(otaUrl)) + "'>"
+          "<button type='submit' class='addbtn'>Save</button>"
+          "</div>"
+          "<div style='font-size:11px;color:#555;margin-top:8px;'>"
+          "Place <b>version.txt</b> &amp; <b>firmware.bin</b> at the URL</div>"
+          "</form>"
+          "<form method='POST' action='/ota-now'>"
+          "<button type='submit' class='wide-btn'>&#8635; Check Now</button>"
+          "</form>"
+          "<hr class='divider'>"
+          "<div class='label'>Direct Upload (.bin)</div>"
+          "<form method='POST' action='/upload' enctype='multipart/form-data'>"
+          "<div class='row'>"
+          "<input type='file' name='firmware' accept='.bin' required"
+          " style='flex:1;padding:8px;'>"
+          "<button type='submit' class='addbtn'>Upload</button>"
+          "</div></form>"
+          "</div>"
+          "</body></html>";
 
   webServer.send(200, "text/html", html);
 }
@@ -377,17 +577,90 @@ void handleSettings() {
       changed = true;
     }
   }
+  // 자동 갱신 주기 저장
+  if (webServer.hasArg("save_refresh")) {
+    int mins = webServer.arg("refresh_min").toInt();
+    if (mins >= 1 && mins <= 60) {
+      dataRefreshMs = (unsigned long)mins * 60000UL;
+      lastDataRefresh = millis(); // 타이머 리셋
+      changed = true;
+    }
+  }
   if (changed) saveSettings();
 
-  webServer.sendHeader("Location", "/");
+  webServer.sendHeader("Location", "/config");
   webServer.send(303);
+}
+
+void handleOtaSave() {
+  String url = webServer.arg("ota_url");
+  url.trim();
+  strncpy(otaUrl, url.c_str(), sizeof(otaUrl) - 1);
+  otaUrl[sizeof(otaUrl) - 1] = '\0';
+  saveSettings();
+  webServer.sendHeader("Location", "/config");
+  webServer.send(303);
+}
+
+void handleOtaNow() {
+  webServer.sendHeader("Location", "/config");
+  webServer.send(303);
+  checkOtaUpdate();
+}
+
+void handleUploadDone() {
+  bool ok = !Update.hasError();
+  String html =
+    "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+    "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+    "<title>OTA</title>"
+    "<style>body{font-family:-apple-system,sans-serif;max-width:480px;margin:60px auto;"
+    "padding:20px;background:#111;color:#eee;text-align:center;}"
+    "h2{font-size:24px;} .ok{color:#3c6;} .err{color:#e44;}"
+    "a{color:#5b9;}</style></head><body>";
+  if (ok) {
+    html += "<h2 class='ok'>Upload successful!</h2>"
+            "<p>Device is restarting...</p>";
+  } else {
+    html += "<h2 class='err'>Upload failed</h2>"
+            "<p>" + String(Update.errorString()) + "</p>"
+            "<p><a href='/config'>Back</a></p>";
+  }
+  html += "</body></html>";
+  webServer.send(200, "text/html", html);
+  if (ok) { delay(1000); ESP.restart(); }
+}
+
+void handleUploadFile() {
+  HTTPUpload& upload = webServer.upload();
+  if (upload.status == UPLOAD_FILE_START) {
+    Serial.printf("[WebOTA] Upload start: %s\n", upload.filename.c_str());
+    drawOtaScreen(0, "Uploading via browser...");
+    if (!Update.begin(UPDATE_SIZE_UNKNOWN)) Update.printError(Serial);
+  } else if (upload.status == UPLOAD_FILE_WRITE) {
+    if (Update.write(upload.buf, upload.currentSize) != upload.currentSize)
+      Update.printError(Serial);
+    // 진행률은 total 크기를 모르므로 수신 바이트만 표시
+    Serial.printf("[WebOTA] Written %u bytes\n", upload.totalSize);
+  } else if (upload.status == UPLOAD_FILE_END) {
+    if (Update.end(true)) {
+      drawOtaScreen(100, "Done! Restarting...");
+      Serial.printf("[WebOTA] Success: %u bytes\n", upload.totalSize);
+    } else {
+      Update.printError(Serial);
+    }
+  }
 }
 
 void setupWebServer() {
   webServer.on("/", HTTP_GET, handleRoot);
+  webServer.on("/config", HTTP_GET, handleConfig);
   webServer.on("/add", HTTP_POST, handleAdd);
   webServer.on("/delete", HTTP_POST, handleDelete);
   webServer.on("/settings", HTTP_POST, handleSettings);
+  webServer.on("/ota", HTTP_POST, handleOtaSave);
+  webServer.on("/ota-now", HTTP_POST, handleOtaNow);
+  webServer.on("/upload", HTTP_POST, handleUploadDone, handleUploadFile);
   webServer.begin();
 }
 
@@ -418,42 +691,63 @@ TickerData fetchYahoo(const char* symbol, const char* suffix, AssetType type) {
   url += suffix;
   url += "?interval="; url += p.yInterval;
   url += "&range=";    url += p.yRange;
+
+  Serial.printf("[Yahoo] %s%s period=%s → GET %s\n",
+                symbol, suffix, p.label, url.c_str());
+
+  unsigned long t0 = millis();
   http.begin(url);
   http.setUserAgent("Mozilla/5.0");
 
   int status = http.GET();
-  if (status == 200) {
-    JsonDocument doc;
-    if (!deserializeJson(doc, http.getString())) {
-      auto result = doc["chart"]["result"][0];
-      auto meta = result["meta"];
-      data.price = meta["regularMarketPrice"];
-      data.valid = data.price > 0;
+  unsigned long elapsed = millis() - t0;
 
-      // 차트: close 배열에서 null 제외하고 채움 (긴 기간이면 다운샘플)
-      auto closes = result["indicators"]["quote"][0]["close"];
-      int total = 0;
-      for (JsonVariant cv : closes.as<JsonArray>()) {
-        if (!cv.isNull()) total++;
-      }
-      int step = (total > MAX_CHART_POINTS) ? total / MAX_CHART_POINTS : 1;
-      int seen = 0;
-      for (JsonVariant cv : closes.as<JsonArray>()) {
-        if (cv.isNull()) continue;
-        if (seen % step == 0 && data.chartCount < MAX_CHART_POINTS) {
-          data.chart[data.chartCount++] = cv.as<float>();
-        }
-        seen++;
-      }
-
-      // 변화율: 차트 시작점 대비
-      if (data.chartCount > 0) {
-        float first = data.chart[0];
-        data.change = first > 0 ? ((data.price - first) / first) * 100.0f : 0;
-      }
-      computeChartRange(data);
-    }
+  if (status != 200) {
+    Serial.printf("[Yahoo] HTTP %d (%lums)\n", status, elapsed);
+    http.end();
+    return data;
   }
+
+  String body = http.getString();
+  Serial.printf("[Yahoo] HTTP 200 (%lums, %u bytes)\n", elapsed, body.length());
+
+  JsonDocument doc;
+  DeserializationError err = deserializeJson(doc, body);
+  if (err) {
+    Serial.printf("[Yahoo] JSON error: %s\n", err.c_str());
+    http.end();
+    return data;
+  }
+
+  auto result = doc["chart"]["result"][0];
+  auto meta = result["meta"];
+  data.price    = meta["regularMarketPrice"].as<float>();
+  data.prevClose = meta["chartPreviousClose"].as<float>();
+  if (data.prevClose == 0) data.prevClose = meta["previousClose"].as<float>();
+  data.valid = data.price > 0;
+
+  auto closes = result["indicators"]["quote"][0]["close"];
+  int total = 0;
+  for (JsonVariant cv : closes.as<JsonArray>()) if (!cv.isNull()) total++;
+  int step = (total > MAX_CHART_POINTS) ? total / MAX_CHART_POINTS : 1;
+  int seen = 0;
+  for (JsonVariant cv : closes.as<JsonArray>()) {
+    if (cv.isNull()) continue;
+    if (seen % step == 0 && data.chartCount < MAX_CHART_POINTS) {
+      data.chart[data.chartCount++] = cv.as<float>();
+    }
+    seen++;
+  }
+
+  // change% 기준: 전일종가 우선, 없으면 첫 차트 포인트
+  float base = (data.prevClose > 0) ? data.prevClose
+             : (data.chartCount > 0) ? data.chart[0] : 0;
+  data.change = (base > 0) ? ((data.price - base) / base) * 100.0f : 0;
+  computeChartRange(data);
+
+  Serial.printf("[Yahoo] price=%.4f prevClose=%.4f change=%+.2f%% points=%d (raw %d, step %d)\n",
+                data.price, data.prevClose, data.change, data.chartCount, total, step);
+
   http.end();
   return data;
 }
@@ -462,7 +756,10 @@ TickerData fetchStock(const char* symbol) {
   return fetchYahoo(symbol, "", TYPE_STOCK);
 }
 TickerData fetchKoreanStock(const char* code) {
-  return fetchYahoo(code, ".KS", TYPE_KSTOCK);
+  TickerData d = fetchYahoo(code, ".KS", TYPE_KSTOCK);
+  strncpy(d.symbol, krCompanyName(code), sizeof(d.symbol) - 1);
+  d.symbol[sizeof(d.symbol) - 1] = '\0';
+  return d;
 }
 
 TickerData fetchCrypto(const char* id) {
@@ -485,48 +782,98 @@ TickerData fetchCrypto(const char* id) {
   url += cgId;
   url += "/ohlc?vs_currency=usd&days=";
   url += String(PERIODS[chartPeriodIdx].cgDays);
+
+  Serial.printf("[Crypto] %s (%s) period=%s → GET %s\n",
+                id, cgId, PERIODS[chartPeriodIdx].label, url.c_str());
+
+  unsigned long t0 = millis();
   http.begin(url);
   http.addHeader("accept", "application/json");
-  http.setTimeout(15000);  // 큰 응답을 위해 타임아웃 여유
+  http.setTimeout(15000);
 
   int code = http.GET();
-  if (code == 200) {
-    JsonDocument doc;
-    if (!deserializeJson(doc, http.getString())) {
-      // 응답: [[ts, open, high, low, close], ...]
-      auto items = doc.as<JsonArray>();
-      int total = items.size();
-      int step = total > MAX_CHART_POINTS ? total / MAX_CHART_POINTS : 1;
-      int i = 0;
-      for (JsonVariant item : items) {
-        if (i % step == 0 && data.chartCount < MAX_CHART_POINTS) {
-          data.chart[data.chartCount++] = item[4].as<float>();  // close
-        }
-        i++;
-      }
-      if (data.chartCount > 0) {
-        data.price = data.chart[data.chartCount - 1];
-        float first = data.chart[0];
-        data.change = first > 0 ? ((data.price - first) / first) * 100.0f : 0;
-        data.valid = true;
-        computeChartRange(data);
-      }
-    } else {
-      Serial.println("CoinGecko JSON parse error");
-    }
-  } else {
-    Serial.printf("CoinGecko HTTP %d\n", code);
+  unsigned long elapsed = millis() - t0;
+
+  if (code != 200) {
+    Serial.printf("[Crypto] HTTP %d (%lums)\n", code, elapsed);
+    http.end();
+    return data;
   }
+
+  String body = http.getString();
+  Serial.printf("[Crypto] HTTP 200 (%lums, %u bytes)\n", elapsed, body.length());
+
+  JsonDocument doc;
+  DeserializationError err = deserializeJson(doc, body);
+  if (err) {
+    Serial.printf("[Crypto] JSON error: %s\n", err.c_str());
+    http.end();
+    return data;
+  }
+
+  // 응답: [[ts, open, high, low, close], ...]
+  auto items = doc.as<JsonArray>();
+  int total = items.size();
+  int step = total > MAX_CHART_POINTS ? total / MAX_CHART_POINTS : 1;
+  int i = 0;
+  for (JsonVariant item : items) {
+    if (i % step == 0 && data.chartCount < MAX_CHART_POINTS) {
+      data.chart[data.chartCount++] = item[4].as<float>();
+    }
+    i++;
+  }
+
   http.end();
+
+  if (data.chartCount == 0) return data;
+
+  float firstOhlc = data.chart[0];
+
+  // simple/price 로 실시간 현재가 취득 (OHLC 캔들 지연 최대 30분 보정)
+  HTTPClient http2;
+  String priceUrl = "https://api.coingecko.com/api/v3/simple/price?ids=";
+  priceUrl += cgId;
+  priceUrl += "&vs_currencies=usd";
+  Serial.printf("[Crypto] simple/price → GET %s\n", priceUrl.c_str());
+
+  unsigned long t1 = millis();
+  http2.begin(priceUrl);
+  http2.addHeader("accept", "application/json");
+  http2.setTimeout(10000);
+  int code2 = http2.GET();
+  Serial.printf("[Crypto] simple/price HTTP %d (%lums)\n", code2, millis() - t1);
+
+  if (code2 == 200) {
+    String body2 = http2.getString();
+    JsonDocument doc2;
+    if (!deserializeJson(doc2, body2)) {
+      float livePrice = doc2[cgId]["usd"].as<float>();
+      if (livePrice > 0) data.price = livePrice;
+    }
+  }
+  http2.end();
+
+  data.change = firstOhlc > 0 ? ((data.price - firstOhlc) / firstOhlc) * 100.0f : 0;
+  data.valid = true;
+  computeChartRange(data);
+
+  Serial.printf("[Crypto] price=%.4f(live) change=%+.2f%% points=%d (raw %d, step %d)\n",
+                data.price, data.change, data.chartCount, total, step);
+
   return data;
 }
 
 TickerData fetchTicker(const char* ticker) {
-  if (strncmp(ticker, "COIN:", 5) == 0)
-    return fetchCrypto(ticker + 5);
-  if (strncmp(ticker, "KR:", 3) == 0)
-    return fetchKoreanStock(ticker + 3);
-  return fetchStock(ticker);
+  Serial.printf("\n─── fetchTicker(\"%s\") [%d/%d] ───\n",
+                ticker, currentIndex + 1, tickerCount);
+  TickerData d;
+  if (strncmp(ticker, "COIN:", 5) == 0)      d = fetchCrypto(ticker + 5);
+  else if (strncmp(ticker, "KR:", 3) == 0)   d = fetchKoreanStock(ticker + 3);
+  else                                       d = fetchStock(ticker);
+
+  if (!d.valid) Serial.println("[!] fetch failed — display will show Load Failed");
+  Serial.println();
+  return d;
 }
 
 // ── 디스플레이 (가로 모드 320 x 170) ─────────────────
@@ -786,15 +1133,40 @@ void drawTicker(const TickerData& d) {
   }
 
   tft.setTextFont(4);
-  tft.setTextSize(2);
+  tft.setTextSize(1);
   tft.setTextColor(COL_PRICE, COL_BG);
   int pw = tft.textWidth(priceBuf);
-  if (pw > 200) {
-    tft.setTextSize(1);
-    pw = tft.textWidth(priceBuf);
-  }
-  tft.setCursor(310 - pw, 38);
+  tft.setCursor(310 - pw, 35);
   tft.print(priceBuf);
+
+  // ── 전일종가 (주식만, 현재가 아래) ──────────────────
+  if (d.prevClose > 0) {
+    char prevBuf[28];
+    if (d.type == TYPE_KSTOCK) {
+      long whole = (long)(d.prevClose + 0.5f);
+      char raw[16]; snprintf(raw, sizeof(raw), "%ld", whole);
+      int len = strlen(raw), j = 0;
+      prevBuf[j++] = 'W';
+      for (int i = 0; i < len; i++) {
+        if (i > 0 && (len - i) % 3 == 0) prevBuf[j++] = ',';
+        prevBuf[j++] = raw[i];
+      }
+      prevBuf[j] = '\0';
+    } else if (d.prevClose >= 1) {
+      snprintf(prevBuf, sizeof(prevBuf), "$%.2f", d.prevClose);
+    } else {
+      snprintf(prevBuf, sizeof(prevBuf), "$%.4f", d.prevClose);
+    }
+    tft.setTextFont(2);
+    tft.setTextSize(1);
+    tft.setTextColor(COL_DIM, COL_BG);
+    int prevLabelW = tft.textWidth("Prev ");
+    int prevValW   = tft.textWidth(prevBuf);
+    tft.setCursor(310 - prevLabelW - prevValW, 68);
+    tft.print("Prev ");
+    tft.setTextColor(COL_TEXT, COL_BG);
+    tft.print(prevBuf);
+  }
 
   // ── 차트 (하단 전체 폭) ───────────────────────────
   drawChart(d, 15, 100, 290, 40);
@@ -911,6 +1283,11 @@ void setup() {
     drawNoTickers();
   }
   lastRefresh = millis();
+  lastDataRefresh = millis();
+
+  // 부팅 시 OTA 체크
+  checkOtaUpdate();
+  lastOtaCheck = millis();
 }
 
 // BOOT 버튼: 짧게 누름 → 종목 전환, 3초 홀드 → 설정 초기화
@@ -962,13 +1339,29 @@ void loop() {
     return;
   }
 
-  // 5초 경과 또는 버튼 누름 → 다음 종목으로 전환
+  // OTA 주기 체크 (1시간마다)
+  if (millis() - lastOtaCheck >= OTA_CHECK_INTERVAL) {
+    lastOtaCheck = millis();
+    checkOtaUpdate();
+  }
+
+  // 자동 갱신: 현재 종목 데이터 재요청 (종목 전환 없음)
+  if (millis() - lastDataRefresh >= dataRefreshMs) {
+    lastDataRefresh = millis();
+    lastRefresh = millis();  // 전환 타이머도 리셋
+    drawLoading(tickers[currentIndex].c_str());
+    drawTicker(fetchTicker(tickers[currentIndex].c_str()));
+    return;
+  }
+
+  // 종목 전환: switchMs 경과 또는 버튼 누름
   if (nextTickerRequested || millis() - lastRefresh >= switchMs) {
     nextTickerRequested = false;
     currentIndex = (currentIndex + 1) % tickerCount;
     drawLoading(tickers[currentIndex].c_str());
     drawTicker(fetchTicker(tickers[currentIndex].c_str()));
     lastRefresh = millis();
+    lastDataRefresh = millis();  // 전환 시 갱신 타이머도 리셋
   } else {
     // 연결 상태만 실시간 갱신 (전체 화면 갱신 없이)
     static bool lastBleState = false;
