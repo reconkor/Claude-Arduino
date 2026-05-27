@@ -104,6 +104,186 @@ void saveParamCallback() {
   prefs.end();
 }
 
+// ── Wipe 전환 효과 ────────────────────────────────────
+// setViewport로 10px 세로 스트립을 왼→오른쪽으로 확장하며
+// 각 스트립 안에서 새 화면을 그림 → 컨텐츠 자체가 밀려오는 효과
+// Shared iris-open kernel: expands a circle from (cx,cy), pushing pixels from buf to screen.
+// buf is W×H row-major RGB565. No fillScreen — new content irises in over whatever is on screen.
+static void irisOpenBuf(uint16_t* buf, int W, int H, int cx, int cy, int maxR,
+                        int steps, int stepDelay) {
+  for (int s = 1; s <= steps; s++) {
+    int r_now = maxR * s / steps;
+    int r_prv = maxR * (s - 1) / steps;
+    for (int y = 0; y < H; y++) {
+      int dy = abs(y - cy);
+      if (dy > r_now) continue;
+      int c_now = (int)sqrtf(max(0.0f, (float)(r_now * r_now - dy * dy)));
+      int x1n = max(0, cx - c_now), x2n = min(W - 1, cx + c_now);
+      if (dy <= r_prv) {
+        int c_prv = (int)sqrtf(max(0.0f, (float)(r_prv * r_prv - dy * dy)));
+        int x1p = cx - c_prv, x2p = cx + c_prv;
+        if (x1n < x1p) { int a=x1n, b=min(W-1,x1p-1); if(a<=b) tft.pushImage(a,y,b-a+1,1,buf+y*W+a); }
+        if (x2n > x2p) { int a=max(0,x2p+1), b=x2n;   if(a<=b) tft.pushImage(a,y,b-a+1,1,buf+y*W+a); }
+      } else {
+        tft.pushImage(x1n, y, x2n - x1n + 1, 1, buf + y * W + x1n);
+      }
+    }
+    delay(stepDelay);
+  }
+}
+
+// Chart rendering into a sprite buffer
+static void renderChartToSprite(TFT_eSprite& s, const TickerData& d,
+                                int x, int y, int w, int h) {
+  if (d.chartCount < 2) return;
+  uint16_t lineColor = (d.change >= 0) ? COL_UP : COL_DOWN;
+  uint16_t fillColor = (d.change >= 0) ? 0x0BC4 : 0x4862;
+  float vmin = d.chartMin, vmax = d.chartMax, range = vmax - vmin;
+  if (range < 0.0001f) range = 1;
+  vmin -= range * 0.05f; vmax += range * 0.05f; range = vmax - vmin;
+  auto yAt = [&](float v) -> int { return y + h - (int)((v - vmin) / range * h); };
+  if (d.chartCount > 0) {
+    int by = yAt(d.chart[0]);
+    if (by >= y && by < y + h)
+      for (int i = x; i < x + w; i += 4) s.drawPixel(i, by, COL_DIVIDER);
+  }
+  for (int i = 0; i < d.chartCount - 1; i++) {
+    int x1 = x + i * w / (d.chartCount - 1);
+    int x2 = x + (i + 1) * w / (d.chartCount - 1);
+    int y1 = yAt(d.chart[i]), y2 = yAt(d.chart[i + 1]);
+    for (int px = x1; px < x2; px++) {
+      float t = (x2 == x1) ? 0 : (float)(px - x1) / (x2 - x1);
+      int py = y1 + (int)((y2 - y1) * t);
+      if (py < y + h) s.drawFastVLine(px, py, y + h - py, fillColor);
+    }
+  }
+  for (int i = 1; i < d.chartCount; i++) {
+    int x1 = x + (i-1) * w / (d.chartCount - 1), x2 = x + i * w / (d.chartCount - 1);
+    int y1 = yAt(d.chart[i-1]), y2 = yAt(d.chart[i]);
+    s.drawLine(x1, y1,   x2, y2,   lineColor);
+    s.drawLine(x1, y1+1, x2, y2+1, lineColor);
+  }
+}
+
+// Full ticker screen rendering into a sprite buffer
+static void renderTickerToSprite(TFT_eSprite& s, const TickerData& d) {
+  s.fillScreen(COL_BG);
+
+  // Header
+  const char* tag; uint16_t tagColor; int tagW;
+  switch (d.type) {
+    case TYPE_CRYPTO: tag="CRYPTO";  tagColor=COL_CRYPTO; tagW=56; break;
+    case TYPE_KSTOCK: tag="K-STOCK"; tagColor=COL_KSTOCK; tagW=62; break;
+    default:          tag="STOCK";   tagColor=COL_STOCK;  tagW=50; break;
+  }
+  s.fillRoundRect(10, 6, tagW, 18, 4, tagColor);
+  s.setTextFont(2); s.setTextSize(1);
+  s.setTextColor(COL_BG, tagColor); s.setCursor(15, 8); s.print(tag);
+  {
+    const char* periodStr = PERIODS[chartPeriodIdx].display;
+    char idxBuf[16]; snprintf(idxBuf, sizeof(idxBuf), "   %d / %d", currentIndex + 1, tickerCount);
+    int startX = 310 - s.textWidth(periodStr) - s.textWidth(idxBuf);
+    s.setTextColor(COL_TEXT, COL_BG); s.setCursor(startX, 8); s.print(periodStr);
+    s.setTextColor(COL_DIM,  COL_BG); s.print(idxBuf);
+  }
+
+  if (!d.valid) {
+    s.setTextFont(4); s.setTextSize(1); s.setTextColor(COL_DOWN, COL_BG);
+    const char* msg = "Load Failed";
+    s.setCursor((320 - s.textWidth(msg)) / 2, 75); s.print(msg);
+  } else {
+    bool up = d.change >= 0;
+    uint16_t chColor = up ? COL_UP : COL_DOWN;
+    uint16_t accent  = (d.type == TYPE_CRYPTO) ? COL_CRYPTO :
+                       (d.type == TYPE_KSTOCK)  ? COL_KSTOCK : COL_STOCK;
+
+    // Symbol + accent line
+    s.setTextFont(4); s.setTextSize(1);
+    char dispName[28]; strncpy(dispName, d.symbol, sizeof(dispName) - 1);
+    dispName[sizeof(dispName) - 1] = '\0';
+    int symW = s.textWidth(dispName);
+    if (symW > 195) {
+      int len = strlen(dispName);
+      while (len > 1) { dispName[--len] = '\0'; char tmp[32];
+        snprintf(tmp, sizeof(tmp), "%s...", dispName);
+        if (s.textWidth(tmp) <= 195) { strncpy(dispName, tmp, sizeof(dispName)-1); break; } }
+      symW = s.textWidth(dispName);
+    }
+    s.setTextColor(COL_TEXT, COL_BG); s.setCursor(15, 38); s.print(dispName);
+    s.drawFastHLine(15, 64, symW, accent);
+
+    // Change arrow + %
+    char chBuf[16]; snprintf(chBuf, sizeof(chBuf), "%+.2f%%", d.change);
+    s.setTextFont(2); s.setTextSize(2);
+    if (up) s.fillTriangle(15,89, 25,89, 20,79, chColor);
+    else    s.fillTriangle(15,79, 25,79, 20,89, chColor);
+    s.setTextColor(chColor, COL_BG); s.setCursor(31, 76); s.print(chBuf);
+
+    // Price
+    char priceBuf[24];
+    if (d.type == TYPE_KSTOCK) {
+      long w2 = (long)(d.price + 0.5f); char raw[16]; snprintf(raw, sizeof(raw), "%ld", w2);
+      int len = strlen(raw), j = 0; priceBuf[j++] = 'W';
+      for (int i = 0; i < len; i++) { if (i > 0 && (len-i) % 3 == 0) priceBuf[j++] = ','; priceBuf[j++] = raw[i]; }
+      priceBuf[j] = '\0';
+    } else if (d.price >= 1) { snprintf(priceBuf, sizeof(priceBuf), "$%.2f",  d.price);
+    } else {                   snprintf(priceBuf, sizeof(priceBuf), "$%.4f",  d.price); }
+    s.setTextFont(4); s.setTextSize(1); s.setTextColor(COL_PRICE, COL_BG);
+    s.setCursor(310 - s.textWidth(priceBuf), 35); s.print(priceBuf);
+
+    // Prev close
+    if (d.prevClose > 0) {
+      char prevBuf[28];
+      if (d.type == TYPE_KSTOCK) {
+        long w2 = (long)(d.prevClose + 0.5f); char raw[16]; snprintf(raw, sizeof(raw), "%ld", w2);
+        int len = strlen(raw), j = 0; prevBuf[j++] = 'W';
+        for (int i = 0; i < len; i++) { if (i > 0 && (len-i) % 3 == 0) prevBuf[j++] = ','; prevBuf[j++] = raw[i]; }
+        prevBuf[j] = '\0';
+      } else if (d.prevClose >= 1) { snprintf(prevBuf, sizeof(prevBuf), "$%.2f", d.prevClose);
+      } else {                       snprintf(prevBuf, sizeof(prevBuf), "$%.4f", d.prevClose); }
+      s.setTextFont(2); s.setTextSize(1); s.setTextColor(COL_DIM, COL_BG);
+      int x0 = 310 - s.textWidth("Prev ") - s.textWidth(prevBuf);
+      s.setCursor(x0, 68); s.print("Prev ");
+      s.setTextColor(COL_TEXT, COL_BG); s.print(prevBuf);
+    }
+
+    // Chart
+    renderChartToSprite(s, d, 15, 100, 290, 40);
+  }
+
+  // Status bar
+  s.drawFastHLine(10, 145, 300, COL_DIVIDER);
+  s.fillRect(0, 150, 320, 18, COL_BG);
+  s.setTextFont(2); s.setTextSize(1);
+  if (bleConnected) {
+    s.fillCircle(16, 160, 4, COL_UP);
+    s.setTextColor(COL_UP,  COL_BG); s.setCursor(28, 153); s.print("Remote ON");
+  } else {
+    s.fillCircle(16, 160, 4, COL_DIM);
+    s.setTextColor(COL_DIM, COL_BG); s.setCursor(28, 153); s.print("Remote --");
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    String ip = WiFi.localIP().toString();
+    s.setTextColor(COL_DIM, COL_BG);
+    s.setCursor(310 - s.textWidth(ip.c_str()), 153); s.print(ip);
+  }
+}
+
+// Iris-open the ticker display over whatever is currently on screen (no fillScreen flash)
+void irisInTicker(const TickerData& d) {
+  const int W = 320, H = 170;
+  TFT_eSprite spr(&tft);
+  spr.setColorDepth(16);
+  uint16_t* buf = (uint16_t*)spr.createSprite(W, H);
+  if (buf) {
+    renderTickerToSprite(spr, d);
+    irisOpenBuf(buf, W, H, W/2, H/2, 185, 30, 14);
+    spr.deleteSprite();
+  } else {
+    drawTicker(d);  // fallback: no PSRAM
+  }
+}
+
 // ── OTA ──────────────────────────────────────────────
 void drawOtaScreen(int pct, const char* msg) {
   tft.fillScreen(COL_BG);
@@ -732,7 +912,7 @@ void doFetchAndDraw(int idx) {
     strncpy(currentData.symbol, tickerNames[idx].c_str(), sizeof(currentData.symbol) - 1);
     currentData.symbol[sizeof(currentData.symbol) - 1] = '\0';
   }
-  drawTicker(currentData);
+  irisInTicker(currentData);
 }
 
 void setupWebServer() {
@@ -1072,23 +1252,127 @@ void drawNoTickers() {
   drawStatusBar();
 }
 
-void drawLoading(const char* symbol) {
-  tft.fillScreen(COL_BG);
+static uint16_t dimColor565(uint16_t c, float f) {
+  uint8_t r = (uint8_t)(((c >> 11) & 0x1F) * f);
+  uint8_t g = (uint8_t)(((c >> 5)  & 0x3F) * f);
+  uint8_t b = (uint8_t)((c         & 0x1F) * f);
+  return (uint16_t)((r << 11) | (g << 5) | b);
+}
+
+// Renders loading content into a sprite buffer (for iris animation)
+static void renderLoadingToSprite(TFT_eSprite& s, int idx) {
+  const int W = 320;
+  String ticker = (idx >= 0 && idx < tickerCount) ? tickers[idx] : "";
+  uint16_t accent; const char* typeLabel; String rawSym;
+  if (ticker.startsWith("COIN:"))    { accent=COL_CRYPTO; typeLabel="CRYPTO";  rawSym=ticker.substring(5); }
+  else if (ticker.startsWith("KR:")) { accent=COL_KSTOCK; typeLabel="K-STOCK"; rawSym=ticker.substring(3); }
+  else                               { accent=COL_STOCK;  typeLabel="STOCK";   rawSym=ticker; }
+
+  s.fillScreen(COL_BG);
+  const int HDR_H = 36;
+  for (int y = 0; y < HDR_H; y++) {
+    float f = 1.0f - (float)y / HDR_H * 0.45f;
+    s.drawFastHLine(0, y, W, dimColor565(accent, f));
+  }
+  s.drawFastHLine(0, HDR_H, W, accent);
+
+  s.setTextFont(2); s.setTextSize(1); s.setTextColor(TFT_WHITE);
+  { int lw = s.textWidth(typeLabel); s.setCursor((W - lw) / 2, 10); s.print(typeLabel); }
+  { char ctr[12]; snprintf(ctr, sizeof(ctr), "%d / %d", idx + 1, tickerCount);
+    s.setTextColor(dimColor565(TFT_WHITE, 0.65f));
+    int cw = s.textWidth(ctr); s.setCursor(W - cw - 10, 10); s.print(ctr); }
+
+  const int BX1=10, BX2=309, BY1=40, BY2=143, BL=12;
+  uint16_t bCol = dimColor565(accent, 0.38f);
+  s.drawFastHLine(BX1,      BY1,BL,bCol); s.drawFastVLine(BX1,      BY1,BL,bCol);
+  s.drawFastHLine(BX2-BL+1, BY1,BL,bCol); s.drawFastVLine(BX2,      BY1,BL,bCol);
+  s.drawFastHLine(BX1,      BY2,BL,bCol); s.drawFastVLine(BX1,BY2-BL+1,BL,bCol);
+  s.drawFastHLine(BX2-BL+1, BY2,BL,bCol); s.drawFastVLine(BX2,BY2-BL+1,BL,bCol);
+
+  s.setTextFont(4); s.setTextSize(2); s.setTextColor(accent, COL_BG);
+  { const char* sym = rawSym.c_str(); int sw = s.textWidth(sym); int sx = (W - sw) / 2;
+    s.setCursor(sx, 48); s.print(sym);
+    s.drawFastHLine(sx, 103, sw, accent);
+    s.drawFastHLine(sx, 106, sw, dimColor565(accent, 0.5f)); }
+
+  s.setTextFont(2); s.setTextSize(1);
+  { String name = (idx >= 0 && idx < tickerCount && tickerNames[idx].length() > 0)
+                  ? tickerNames[idx] : rawSym;
+    char dispName[40]; strncpy(dispName, name.c_str(), sizeof(dispName) - 1);
+    dispName[sizeof(dispName) - 1] = '\0';
+    if (s.textWidth(dispName) > 280) {
+      int len = strlen(dispName);
+      while (len > 1) { dispName[--len] = '\0'; char tmp[44];
+        snprintf(tmp, sizeof(tmp), "%s...", dispName);
+        if (s.textWidth(tmp) <= 280) { strncpy(dispName, tmp, sizeof(dispName) - 1); break; } }
+    }
+    s.setTextColor(COL_DIM, COL_BG);
+    int nw = s.textWidth(dispName); s.setCursor((W - nw) / 2, 108); s.print(dispName); }
+  { const char* msg = "Fetching data . . ."; s.setTextColor(COL_DIVIDER, COL_BG);
+    int mw = s.textWidth(msg); s.setCursor((W - mw) / 2, 126); s.print(msg); }
+}
+
+void drawLoading(int idx) {
+  const int CONTENT_H = 145;  // above status bar
+  const int W = 320;
+
+  TFT_eSprite spr(&tft);
+  spr.setColorDepth(16);
+  uint16_t* buf = (uint16_t*)spr.createSprite(W, CONTENT_H);
+
+  if (buf) {
+    renderLoadingToSprite(spr, idx);
+    // Iris-open directly over whatever is on screen — no fillScreen, no black flash
+    irisOpenBuf(buf, W, CONTENT_H, W / 2, CONTENT_H / 2, 180, 30, 14);
+    spr.deleteSprite();
+  } else {
+    // No PSRAM — draw directly without animation
+    tft.fillScreen(COL_BG);  // fallback only: no sprite, must clear
+    String ticker = (idx >= 0 && idx < tickerCount) ? tickers[idx] : "";
+    uint16_t accent; const char* typeLabel; String rawSym;
+    if (ticker.startsWith("COIN:"))    { accent=COL_CRYPTO; typeLabel="CRYPTO";  rawSym=ticker.substring(5); }
+    else if (ticker.startsWith("KR:")) { accent=COL_KSTOCK; typeLabel="K-STOCK"; rawSym=ticker.substring(3); }
+    else                               { accent=COL_STOCK;  typeLabel="STOCK";   rawSym=ticker; }
+    const int HDR_H = 36;
+    for (int y = 0; y < HDR_H; y++) {
+      float f = 1.0f - (float)y / HDR_H * 0.45f;
+      tft.drawFastHLine(0, y, W, dimColor565(accent, f));
+    }
+    tft.drawFastHLine(0, HDR_H, W, accent);
+    tft.setTextFont(2); tft.setTextSize(1); tft.setTextColor(TFT_WHITE);
+    { int lw = tft.textWidth(typeLabel); tft.setCursor((W - lw) / 2, 10); tft.print(typeLabel); }
+    { char ctr[12]; snprintf(ctr, sizeof(ctr), "%d / %d", idx + 1, tickerCount);
+      tft.setTextColor(dimColor565(TFT_WHITE, 0.65f));
+      int cw = tft.textWidth(ctr); tft.setCursor(W - cw - 10, 10); tft.print(ctr); }
+    const int BX1=10, BX2=309, BY1=40, BY2=143, BL=12;
+    uint16_t bCol = dimColor565(accent, 0.38f);
+    tft.drawFastHLine(BX1,      BY1,BL,bCol); tft.drawFastVLine(BX1,      BY1,BL,bCol);
+    tft.drawFastHLine(BX2-BL+1, BY1,BL,bCol); tft.drawFastVLine(BX2,      BY1,BL,bCol);
+    tft.drawFastHLine(BX1,      BY2,BL,bCol); tft.drawFastVLine(BX1,BY2-BL+1,BL,bCol);
+    tft.drawFastHLine(BX2-BL+1, BY2,BL,bCol); tft.drawFastVLine(BX2,BY2-BL+1,BL,bCol);
+    tft.setTextFont(4); tft.setTextSize(2); tft.setTextColor(accent, COL_BG);
+    { const char* sym = rawSym.c_str(); int sw = tft.textWidth(sym); int sx = (W - sw) / 2;
+      tft.setCursor(sx, 48); tft.print(sym);
+      tft.drawFastHLine(sx, 103, sw, accent);
+      tft.drawFastHLine(sx, 106, sw, dimColor565(accent, 0.5f)); }
+    tft.setTextFont(2); tft.setTextSize(1);
+    { String name = (idx >= 0 && idx < tickerCount && tickerNames[idx].length() > 0)
+                    ? tickerNames[idx] : rawSym;
+      char dispName[40]; strncpy(dispName, name.c_str(), sizeof(dispName) - 1);
+      dispName[sizeof(dispName) - 1] = '\0';
+      if (tft.textWidth(dispName) > 280) {
+        int len = strlen(dispName);
+        while (len > 1) { dispName[--len] = '\0'; char tmp[44];
+          snprintf(tmp, sizeof(tmp), "%s...", dispName);
+          if (tft.textWidth(tmp) <= 280) { strncpy(dispName, tmp, sizeof(dispName) - 1); break; } }
+      }
+      tft.setTextColor(COL_DIM, COL_BG);
+      int nw = tft.textWidth(dispName); tft.setCursor((W - nw) / 2, 108); tft.print(dispName); }
+    { const char* msg = "Fetching data . . ."; tft.setTextColor(COL_DIVIDER, COL_BG);
+      int mw = tft.textWidth(msg); tft.setCursor((W - mw) / 2, 126); tft.print(msg); }
+  }
+
   drawStatusBar();
-
-  tft.setTextFont(4);
-  tft.setTextSize(2);
-  tft.setTextColor(COL_DIM, COL_BG);
-  int sw = tft.textWidth(symbol);
-  tft.setCursor((320 - sw) / 2, 50);
-  tft.print(symbol);
-
-  tft.setTextFont(2);
-  tft.setTextSize(1);
-  const char* msg = "Loading...";
-  int mw = tft.textWidth(msg);
-  tft.setCursor((320 - mw) / 2, 110);
-  tft.print(msg);
 }
 
 // 차트 그리기 (라인 + 베이스라인 + 영역 채움)
@@ -1384,7 +1668,7 @@ void setup() {
   Serial.println("BLE advertising as 'TickerDisplay'");
 
   if (tickerCount > 0) {
-    drawLoading(tickers[currentIndex].c_str());
+    drawLoading(currentIndex);
     doFetchAndDraw(currentIndex);
   } else {
     drawNoTickers();
@@ -1457,7 +1741,7 @@ void loop() {
   if (millis() - lastDataRefresh >= dataRefreshMs) {
     lastDataRefresh = millis();
     lastRefresh = millis();
-    drawLoading(tickers[currentIndex].c_str());
+    drawLoading(currentIndex);
     doFetchAndDraw(currentIndex);
     return;
   }
@@ -1469,7 +1753,7 @@ void loop() {
     currentIndex = (currentIndex + 1) % tickerCount;
     lastRefresh = millis();
     lastDataRefresh = millis();
-    drawLoading(tickers[currentIndex].c_str());
+    drawLoading(currentIndex);
     doFetchAndDraw(currentIndex);
     return;
   }
