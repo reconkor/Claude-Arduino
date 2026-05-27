@@ -45,6 +45,7 @@ using fs::FS;
 #include <WiFiClientSecure.h>
 
 String tickers[MAX_TICKERS];
+String tickerNames[MAX_TICKERS];   // shortName 캐시 (KR 주식용)
 int tickerCount = 0;
 WebServer webServer(80);
 
@@ -56,7 +57,7 @@ enum AssetType { TYPE_STOCK, TYPE_CRYPTO, TYPE_KSTOCK };
 const int MAX_CHART_POINTS = 60;
 
 struct TickerData {
-  char symbol[16];
+  char symbol[24];
   float price;
   float prevClose;
   float change;
@@ -67,38 +68,6 @@ struct TickerData {
   float chartMin;
   float chartMax;
 };
-
-// 한국 주식 코드 → 기업명 매핑
-struct KrCompany { const char* code; const char* name; };
-const KrCompany KR_COMPANIES[] = {
-  {"005930", "Samsung"},
-  {"000660", "SK Hynix"},
-  {"035720", "Kakao"},
-  {"005380", "Hyundai"},
-  {"051910", "LG Chem"},
-  {"035420", "Naver"},
-  {"006400", "Samsung SDI"},
-  {"066570", "LG Elec"},
-  {"105560", "KB Fin"},
-  {"055550", "Shinhan"},
-  {"096770", "SK Inno"},
-  {"003550", "LG Corp"},
-  {"017670", "SK Telecom"},
-  {"030200", "KT"},
-  {"000270", "Kia"},
-  {"005490", "POSCO"},
-  {"012330", "H.Mobis"},
-  {"032830", "Samsung Li"},
-  {"086790", "Hana Fin"},
-  {"028260", "Samsung CT"},
-};
-const int KR_COMPANY_COUNT = sizeof(KR_COMPANIES) / sizeof(KR_COMPANIES[0]);
-
-const char* krCompanyName(const char* code) {
-  for (int i = 0; i < KR_COMPANY_COUNT; i++)
-    if (strcmp(code, KR_COMPANIES[i].code) == 0) return KR_COMPANIES[i].name;
-  return code;
-}
 
 // ── 컬러 팔레트 ───────────────────────────────────────
 #define COL_BG       TFT_BLACK
@@ -119,6 +88,10 @@ volatile bool bleConnected = false;
 char otaUrl[128] = "";           // e.g. http://192.168.1.10/firmware
 unsigned long lastOtaCheck = 0;
 const unsigned long OTA_CHECK_INTERVAL = 3600000UL; // 1시간
+
+unsigned long priceRefreshMs = 30000;  // 가격 갱신 주기 (기본 30초, 주식/한국주식만)
+unsigned long lastPriceRefresh = 0;
+TickerData currentData = {};           // 현재 표시 중인 티커 데이터
 
 // ── WiFiManager ───────────────────────────────────────
 WiFiManager wm;
@@ -299,21 +272,88 @@ void parseTickerList(const String& csv) {
 }
 
 void saveTickers() {
-  String joined;
+  String joined, joinedNames;
   for (int i = 0; i < tickerCount; i++) {
-    if (i > 0) joined += ",";
+    if (i > 0) { joined += ","; joinedNames += "|"; }
     joined += tickers[i];
+    joinedNames += tickerNames[i];
   }
   prefs.begin("ticker", false);
   prefs.putString("tickers", joined);
+  prefs.putString("tnames", joinedNames);
   prefs.end();
 }
 
 void loadTickers() {
   prefs.begin("ticker", true);
   String saved = prefs.getString("tickers", DEFAULT_TICKERS);
+  String savedNames = prefs.getString("tnames", "");
   prefs.end();
   parseTickerList(saved);
+  // tickerNames 로드 ('|' 구분)
+  int idx = 0, start = 0;
+  while (start <= (int)savedNames.length() && idx < tickerCount) {
+    int sep = savedNames.indexOf('|', start);
+    if (sep < 0) sep = savedNames.length();
+    tickerNames[idx++] = savedNames.substring(start, sep);
+    start = sep + 1;
+  }
+}
+
+// Yahoo Finance에서 longName 조회 (yfSymbol: "AAPL", "005930.KS", "BTC-USD" 등)
+String fetchLongName(const String& yfSymbol) {
+  HTTPClient http;
+  String url = "https://query1.finance.yahoo.com/v8/finance/chart/" + yfSymbol + "?interval=1d&range=1d";
+  http.begin(url);
+  http.setUserAgent("Mozilla/5.0");
+  http.setTimeout(8000);
+  if (http.GET() != 200) { http.end(); return ""; }
+  String body = http.getString();
+  http.end();
+  JsonDocument doc;
+  if (deserializeJson(doc, body)) return "";
+  const char* name = doc["chart"]["result"][0]["meta"]["longName"] | "";
+  return String(name);
+}
+
+// Yahoo Finance에서 현재가만 빠르게 조회 (차트 제외)
+float fetchPriceYahoo(const String& yfSym) {
+  HTTPClient http;
+  String url = "https://query1.finance.yahoo.com/v8/finance/chart/" + yfSym + "?interval=1d&range=1d";
+  http.begin(url);
+  http.setUserAgent("Mozilla/5.0");
+  http.setTimeout(8000);
+  if (http.GET() != 200) { http.end(); return -1.0f; }
+  String body = http.getString();
+  http.end();
+  JsonDocument doc;
+  if (deserializeJson(doc, body)) return -1.0f;
+  return doc["chart"]["result"][0]["meta"]["regularMarketPrice"] | -1.0f;
+}
+
+// 이름이 없는 종목의 shortName을 일괄 조회 (부팅 시 1회)
+void fetchMissingNames() {
+  bool changed = false;
+  for (int i = 0; i < tickerCount; i++) {
+    if (tickerNames[i].length() > 0) continue;  // 이미 있으면 skip
+    String name;
+    if (tickers[i].startsWith("COIN:")) {
+      String sym = tickers[i].substring(5);      // BTC
+      name = fetchLongName(sym + "-USD");        // BTC-USD
+      if (name.endsWith(" USD")) name = name.substring(0, name.length() - 4);
+      if (name.length() == 0) name = sym;
+    } else if (tickers[i].startsWith("KR:")) {
+      String code = tickers[i].substring(3);
+      name = fetchLongName(code + ".KS");
+      if (name.length() == 0) name = code;
+    } else {
+      name = fetchLongName(tickers[i]);
+      if (name.length() == 0) name = tickers[i];
+    }
+    tickerNames[i] = name;
+    changed = true;
+  }
+  if (changed) saveTickers();
 }
 
 void loadSettings() {
@@ -326,6 +366,9 @@ void loadSettings() {
   dataRefreshMs = prefs.getULong("refresh_ms", 300000);
   if (dataRefreshMs < 60000) dataRefreshMs = 60000;
   if (dataRefreshMs > 3600000) dataRefreshMs = 3600000;
+  priceRefreshMs = prefs.getULong("price_ms", 30000);
+  if (priceRefreshMs < 10000) priceRefreshMs = 10000;
+  if (priceRefreshMs > 3600000) priceRefreshMs = 3600000;
   String savedOta = prefs.getString("ota_url", "");
   strncpy(otaUrl, savedOta.c_str(), sizeof(otaUrl) - 1);
   prefs.end();
@@ -336,6 +379,7 @@ void saveSettings() {
   prefs.putInt("period", chartPeriodIdx);
   prefs.putULong("switch_ms", switchMs);
   prefs.putULong("refresh_ms", dataRefreshMs);
+  prefs.putULong("price_ms", priceRefreshMs);
   prefs.putString("ota_url", otaUrl);
   prefs.end();
 }
@@ -407,22 +451,23 @@ void handleRoot() {
     html += "<div class='empty'>No tickers. Add one below.</div>";
   } else {
     for (int i = 0; i < tickerCount; i++) {
-      String display = tickers[i];
-      String tagClass, tagText;
+      String code, tagClass, tagText;
       if (tickers[i].startsWith("COIN:")) {
-        display = tickers[i].substring(5);
+        code = tickers[i].substring(5);
         tagClass = "crypto"; tagText = "CRYPTO";
       } else if (tickers[i].startsWith("KR:")) {
-        String code = tickers[i].substring(3);
-        const char* name = krCompanyName(code.c_str());
-        display = (name != code.c_str()) ? String(name) + " (" + code + ")" : code;
+        code = tickers[i].substring(3);
         tagClass = "kstock"; tagText = "K-STOCK";
       } else {
+        code = tickers[i];
         tagClass = "stock"; tagText = "STOCK";
       }
+      // name: 저장된 shortName 우선, 없으면 코드
+      String name = tickerNames[i].length() > 0 ? tickerNames[i] : code;
+      String sub  = (name != code) ? "<br><span style='font-size:11px;color:#666;'>" + htmlEscape(code) + "</span>" : "";
       html += "<div class='item'>"
               "<span class='tag " + tagClass + "'>" + tagText + "</span>"
-              "<span class='sym'>" + htmlEscape(display) + "</span>"
+              "<span class='sym'>" + htmlEscape(name) + sub + "</span>"
               "<form method='POST' action='/delete'>"
               "<input type='hidden' name='idx' value='" + String(i) + "'>"
               "<button class='del'>Remove</button></form>"
@@ -491,6 +536,11 @@ void handleConfig() {
           "<input type='number' name='refresh_min' min='1' max='60' value='" + String(dataRefreshMs / 60000) + "'>"
           "<button type='submit' name='save_refresh' value='1' class='addbtn'>Save</button>"
           "</div></div>"
+          "<div><div class='label'>Price Refresh — Stock &amp; K-Stock only (seconds)</div>"
+          "<div class='row'>"
+          "<input type='number' name='price_sec' min='10' max='3600' value='" + String(priceRefreshMs / 1000) + "'>"
+          "<button type='submit' name='save_price' value='1' class='addbtn'>Save</button>"
+          "</div></div>"
           "</div></form></div>";
 
   // ── 펌웨어 업데이트 ───────────────────────────────
@@ -513,11 +563,10 @@ void handleConfig() {
           "<hr class='divider'>"
           "<div class='label'>Direct Upload (.bin)</div>"
           "<form method='POST' action='/upload' enctype='multipart/form-data'>"
-          "<div class='row'>"
           "<input type='file' name='firmware' accept='.bin' required"
-          " style='flex:1;padding:8px;'>"
-          "<button type='submit' class='addbtn'>Upload</button>"
-          "</div></form>"
+          " style='width:100%;box-sizing:border-box;margin-bottom:8px;'>"
+          "<button type='submit' class='addbtn' style='width:100%;'>Upload</button>"
+          "</form>"
           "</div>"
           "</body></html>";
 
@@ -535,10 +584,20 @@ void handleAdd() {
   symbol.toUpperCase();
 
   if (symbol.length() > 0) {
-    String full;
-    if      (type == "crypto") full = "COIN:" + symbol;
-    else if (type == "kstock") full = "KR:" + symbol;
-    else                       full = symbol;
+    String full, name;
+    if (type == "crypto") {
+      full = "COIN:" + symbol;
+      name = fetchLongName(symbol + "-USD");
+      if (name.endsWith(" USD")) name = name.substring(0, name.length() - 4);
+      if (name.length() == 0) name = symbol;
+    } else if (type == "kstock") {
+      full = "KR:" + symbol;
+      name = fetchLongName(symbol + ".KS");
+    } else {
+      full = symbol;
+      name = fetchLongName(symbol);        // US 주식도 shortName 조회
+    }
+    tickerNames[tickerCount] = name;
     tickers[tickerCount++] = full;
     saveTickers();
   }
@@ -549,8 +608,12 @@ void handleAdd() {
 void handleDelete() {
   int idx = webServer.arg("idx").toInt();
   if (idx >= 0 && idx < tickerCount) {
-    for (int i = idx; i < tickerCount - 1; i++) tickers[i] = tickers[i + 1];
+    for (int i = idx; i < tickerCount - 1; i++) {
+      tickers[i] = tickers[i + 1];
+      tickerNames[i] = tickerNames[i + 1];
+    }
     tickers[tickerCount - 1] = "";
+    tickerNames[tickerCount - 1] = "";
     tickerCount--;
     if (currentIndex >= tickerCount) currentIndex = 0;
     saveTickers();
@@ -582,7 +645,16 @@ void handleSettings() {
     int mins = webServer.arg("refresh_min").toInt();
     if (mins >= 1 && mins <= 60) {
       dataRefreshMs = (unsigned long)mins * 60000UL;
-      lastDataRefresh = millis(); // 타이머 리셋
+      lastDataRefresh = millis();
+      changed = true;
+    }
+  }
+  // 가격 갱신 주기 저장
+  if (webServer.hasArg("save_price")) {
+    int sec = webServer.arg("price_sec").toInt();
+    if (sec >= 10 && sec <= 3600) {
+      priceRefreshMs = (unsigned long)sec * 1000UL;
+      lastPriceRefresh = millis();
       changed = true;
     }
   }
@@ -650,6 +722,17 @@ void handleUploadFile() {
       Update.printError(Serial);
     }
   }
+}
+
+// 종목 데이터 페치 후 화면 표시 (이름 오버라이드 포함)
+// lastPriceRefresh는 건드리지 않음 — 가격 갱신 타이머는 종목 전환과 독립
+void doFetchAndDraw(int idx) {
+  currentData = fetchTicker(tickers[idx].c_str());
+  if (tickerNames[idx].length() > 0) {
+    strncpy(currentData.symbol, tickerNames[idx].c_str(), sizeof(currentData.symbol) - 1);
+    currentData.symbol[sizeof(currentData.symbol) - 1] = '\0';
+  }
+  drawTicker(currentData);
 }
 
 void setupWebServer() {
@@ -726,6 +809,15 @@ TickerData fetchYahoo(const char* symbol, const char* suffix, AssetType type) {
   if (data.prevClose == 0) data.prevClose = meta["previousClose"].as<float>();
   data.valid = data.price > 0;
 
+  // 주식: longName을 심볼로 사용 (API에서 직접 취득)
+  if (type == TYPE_KSTOCK || type == TYPE_STOCK) {
+    const char* name = meta["longName"] | "";
+    if (strlen(name) > 0) {
+      strncpy(data.symbol, name, sizeof(data.symbol) - 1);
+      data.symbol[sizeof(data.symbol) - 1] = '\0';
+    }
+  }
+
   auto closes = result["indicators"]["quote"][0]["close"];
   int total = 0;
   for (JsonVariant cv : closes.as<JsonArray>()) if (!cv.isNull()) total++;
@@ -756,10 +848,7 @@ TickerData fetchStock(const char* symbol) {
   return fetchYahoo(symbol, "", TYPE_STOCK);
 }
 TickerData fetchKoreanStock(const char* code) {
-  TickerData d = fetchYahoo(code, ".KS", TYPE_KSTOCK);
-  strncpy(d.symbol, krCompanyName(code), sizeof(d.symbol) - 1);
-  d.symbol[sizeof(d.symbol) - 1] = '\0';
-  return d;
+  return fetchYahoo(code, ".KS", TYPE_KSTOCK);
 }
 
 TickerData fetchCrypto(const char* id) {
@@ -1082,13 +1171,30 @@ void drawTicker(const TickerData& d) {
   uint16_t accent = (d.type == TYPE_CRYPTO) ? COL_CRYPTO :
                     (d.type == TYPE_KSTOCK) ? COL_KSTOCK : COL_STOCK;
 
-  // ── 좌측: 심볼 (작게) + 변화율 (아래) ─────────────
-  tft.setTextFont(4);
-  tft.setTextSize(1);
+  // ── 좌측: 심볼 + 변화율 ─────────────────────────────
+  // Font4/size1(26px) 고정 — 넘칠 경우 "..."으로 잘라서 표시
+  tft.setTextFont(4); tft.setTextSize(1);
+  const int NAME_MAX_W = 195;
+  char dispName[28];
+  strncpy(dispName, d.symbol, sizeof(dispName) - 1);
+  dispName[sizeof(dispName) - 1] = '\0';
+  int symW = tft.textWidth(dispName);
+  if (symW > NAME_MAX_W) {
+    int len = strlen(dispName);
+    while (len > 1) {
+      dispName[--len] = '\0';
+      char tmp[32];
+      snprintf(tmp, sizeof(tmp), "%s...", dispName);
+      if (tft.textWidth(tmp) <= NAME_MAX_W) {
+        strncpy(dispName, tmp, sizeof(dispName) - 1);
+        break;
+      }
+    }
+    symW = tft.textWidth(dispName);
+  }
   tft.setTextColor(COL_TEXT, COL_BG);
   tft.setCursor(15, 38);
-  tft.print(d.symbol);
-  int symW = tft.textWidth(d.symbol);
+  tft.print(dispName);
   // 액센트 라인
   tft.drawFastHLine(15, 64, symW, accent);
 
@@ -1270,6 +1376,7 @@ void setup() {
 
   loadTickers();
   loadSettings();
+  fetchMissingNames();   // 기존 종목의 누락된 이름 일괄 조회
   setupWebServer();
   Serial.printf("Web UI: http://%s/\n", WiFi.localIP().toString().c_str());
 
@@ -1278,12 +1385,13 @@ void setup() {
 
   if (tickerCount > 0) {
     drawLoading(tickers[currentIndex].c_str());
-    drawTicker(fetchTicker(tickers[currentIndex].c_str()));
+    doFetchAndDraw(currentIndex);
   } else {
     drawNoTickers();
   }
   lastRefresh = millis();
   lastDataRefresh = millis();
+  lastPriceRefresh = millis();  // 부팅 후 priceRefreshMs 뒤에 첫 갱신
 
   // 부팅 시 OTA 체크
   checkOtaUpdate();
@@ -1345,29 +1453,51 @@ void loop() {
     checkOtaUpdate();
   }
 
-  // 자동 갱신: 현재 종목 데이터 재요청 (종목 전환 없음)
+  // 전체 데이터 갱신 (차트 포함, dataRefreshMs 마다)
   if (millis() - lastDataRefresh >= dataRefreshMs) {
     lastDataRefresh = millis();
-    lastRefresh = millis();  // 전환 타이머도 리셋
+    lastRefresh = millis();
     drawLoading(tickers[currentIndex].c_str());
-    drawTicker(fetchTicker(tickers[currentIndex].c_str()));
+    doFetchAndDraw(currentIndex);
     return;
   }
 
-  // 종목 전환: switchMs 경과 또는 버튼 누름
+  // 종목 전환 (switchMs 마다 또는 버튼 누름)
+  // lastPriceRefresh 건드리지 않음 — 가격 타이머는 독립적으로 흐름
   if (nextTickerRequested || millis() - lastRefresh >= switchMs) {
     nextTickerRequested = false;
     currentIndex = (currentIndex + 1) % tickerCount;
-    drawLoading(tickers[currentIndex].c_str());
-    drawTicker(fetchTicker(tickers[currentIndex].c_str()));
     lastRefresh = millis();
-    lastDataRefresh = millis();  // 전환 시 갱신 타이머도 리셋
-  } else {
-    // 연결 상태만 실시간 갱신 (전체 화면 갱신 없이)
-    static bool lastBleState = false;
-    if (bleConnected != lastBleState) {
-      lastBleState = bleConnected;
-      drawStatusBar();
+    lastDataRefresh = millis();
+    drawLoading(tickers[currentIndex].c_str());
+    doFetchAndDraw(currentIndex);
+    return;
+  }
+
+  // 가격 빠른 갱신 (주식/한국주식만, priceRefreshMs 마다)
+  if (currentData.valid && currentData.type != TYPE_CRYPTO &&
+      millis() - lastPriceRefresh >= priceRefreshMs) {
+    lastPriceRefresh = millis();
+    String yfSym = tickers[currentIndex].startsWith("KR:")
+                   ? tickers[currentIndex].substring(3) + ".KS"
+                   : tickers[currentIndex];
+    float newPrice = fetchPriceYahoo(yfSym);
+    if (newPrice > 0) {
+      currentData.price = newPrice;
+      float base = (currentData.prevClose > 0) ? currentData.prevClose
+                 : (currentData.chartCount > 0) ? currentData.chart[0] : 0;
+      currentData.change = (base > 0) ? ((newPrice - base) / base) * 100.0f : 0;
+      Serial.printf("[PriceRefresh] %s → %.4f (%+.2f%%)\n",
+                    yfSym.c_str(), newPrice, currentData.change);
+      drawTicker(currentData);
     }
+    return;
+  }
+
+  // BLE 연결 상태 변경 시 상태바만 갱신
+  static bool lastBleState = false;
+  if (bleConnected != lastBleState) {
+    lastBleState = bleConnected;
+    drawStatusBar();
   }
 }
