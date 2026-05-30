@@ -483,7 +483,7 @@ void loadTickers() {
 // Yahoo Finance에서 longName 조회 (yfSymbol: "AAPL", "005930.KS", "BTC-USD" 등)
 String fetchLongName(const String& yfSymbol) {
   HTTPClient http;
-  String url = "https://query1.finance.yahoo.com/v8/finance/chart/" + yfSymbol + "?interval=1d&range=1d";
+  String url = "https://query1.finance.yahoo.com/v8/finance/chart/" + yfSymbol + "?interval=1d&range=5d";
   http.begin(url);
   http.setUserAgent("Mozilla/5.0");
   http.setTimeout(8000);
@@ -499,7 +499,7 @@ String fetchLongName(const String& yfSymbol) {
 // Yahoo Finance에서 현재가만 빠르게 조회 (차트 제외)
 float fetchPriceYahoo(const String& yfSym) {
   HTTPClient http;
-  String url = "https://query1.finance.yahoo.com/v8/finance/chart/" + yfSym + "?interval=1d&range=1d";
+  String url = "https://query1.finance.yahoo.com/v8/finance/chart/" + yfSym + "?interval=1d&range=5d";
   http.begin(url);
   http.setUserAgent("Mozilla/5.0");
   http.setTimeout(8000);
@@ -948,79 +948,98 @@ TickerData fetchYahoo(const char* symbol, const char* suffix, AssetType type) {
 
   const ChartPeriod& p = PERIODS[chartPeriodIdx];
 
-  HTTPClient http;
-  String url = "https://query1.finance.yahoo.com/v8/finance/chart/";
-  url += symbol;
-  url += suffix;
-  url += "?interval="; url += p.yInterval;
-  url += "&range=";    url += p.yRange;
+  // 1D 기간은 장 마감/자정 전환 시 API 오류가 잦으므로 실패 시 5D로 fallback
+  const char* tryRanges[]    = { p.yRange,    "5d" };
+  const char* tryIntervals[] = { p.yInterval, "1h" };
+  int maxTries = (strcmp(p.yRange, "1d") == 0) ? 2 : 1;
 
-  Serial.printf("[Yahoo] %s%s period=%s → GET %s\n",
-                symbol, suffix, p.label, url.c_str());
+  for (int attempt = 0; attempt < maxTries; attempt++) {
+    HTTPClient http;
+    String url = "https://query1.finance.yahoo.com/v8/finance/chart/";
+    url += symbol;
+    url += suffix;
+    url += "?interval="; url += tryIntervals[attempt];
+    url += "&range=";    url += tryRanges[attempt];
 
-  unsigned long t0 = millis();
-  http.begin(url);
-  http.setUserAgent("Mozilla/5.0");
+    Serial.printf("[Yahoo] %s%s period=%s → GET %s%s\n",
+                  symbol, suffix, p.label, url.c_str(),
+                  attempt > 0 ? " (fallback 5d)" : "");
 
-  int status = http.GET();
-  unsigned long elapsed = millis() - t0;
+    unsigned long t0 = millis();
+    http.begin(url);
+    http.setUserAgent("Mozilla/5.0");
 
-  if (status != 200) {
-    Serial.printf("[Yahoo] HTTP %d (%lums)\n", status, elapsed);
+    int status = http.GET();
+    unsigned long elapsed = millis() - t0;
+
+    if (status != 200) {
+      Serial.printf("[Yahoo] HTTP %d (%lums)\n", status, elapsed);
+      http.end();
+      continue;
+    }
+
+    String body = http.getString();
+    Serial.printf("[Yahoo] HTTP 200 (%lums, %u bytes)\n", elapsed, body.length());
+
+    JsonDocument doc;
+    DeserializationError err = deserializeJson(doc, body);
+    if (err) {
+      Serial.printf("[Yahoo] JSON error: %s\n", err.c_str());
+      http.end();
+      continue;
+    }
+
+    auto result = doc["chart"]["result"][0];
+    auto meta = result["meta"];
+    float price = meta["regularMarketPrice"].as<float>();
+
+    if (price <= 0) {
+      http.end();
+      continue;
+    }
+
+    data.price     = price;
+    data.prevClose = meta["chartPreviousClose"].as<float>();
+    if (data.prevClose == 0) data.prevClose = meta["previousClose"].as<float>();
+    data.valid = true;
+
+    // 주식: longName을 심볼로 사용 (API에서 직접 취득)
+    if (type == TYPE_KSTOCK || type == TYPE_STOCK) {
+      const char* name = meta["longName"] | "";
+      if (strlen(name) > 0) {
+        strncpy(data.symbol, name, sizeof(data.symbol) - 1);
+        data.symbol[sizeof(data.symbol) - 1] = '\0';
+      }
+    }
+
+    auto closes = result["indicators"]["quote"][0]["close"];
+    int total = 0;
+    for (JsonVariant cv : closes.as<JsonArray>()) if (!cv.isNull()) total++;
+    int step = (total > MAX_CHART_POINTS) ? total / MAX_CHART_POINTS : 1;
+    int seen = 0;
+    for (JsonVariant cv : closes.as<JsonArray>()) {
+      if (cv.isNull()) continue;
+      if (seen % step == 0 && data.chartCount < MAX_CHART_POINTS) {
+        data.chart[data.chartCount++] = cv.as<float>();
+      }
+      seen++;
+    }
+
+    // change% 기준: 전일종가 우선, 없으면 첫 차트 포인트
+    float base = (data.prevClose > 0) ? data.prevClose
+               : (data.chartCount > 0) ? data.chart[0] : 0;
+    data.change = (base > 0) ? ((data.price - base) / base) * 100.0f : 0;
+    computeChartRange(data);
+
+    Serial.printf("[Yahoo] price=%.4f prevClose=%.4f change=%+.2f%% points=%d (raw %d, step %d)%s\n",
+                  data.price, data.prevClose, data.change, data.chartCount, total, step,
+                  attempt > 0 ? " [5d fallback]" : "");
+
     http.end();
     return data;
   }
 
-  String body = http.getString();
-  Serial.printf("[Yahoo] HTTP 200 (%lums, %u bytes)\n", elapsed, body.length());
-
-  JsonDocument doc;
-  DeserializationError err = deserializeJson(doc, body);
-  if (err) {
-    Serial.printf("[Yahoo] JSON error: %s\n", err.c_str());
-    http.end();
-    return data;
-  }
-
-  auto result = doc["chart"]["result"][0];
-  auto meta = result["meta"];
-  data.price    = meta["regularMarketPrice"].as<float>();
-  data.prevClose = meta["chartPreviousClose"].as<float>();
-  if (data.prevClose == 0) data.prevClose = meta["previousClose"].as<float>();
-  data.valid = data.price > 0;
-
-  // 주식: longName을 심볼로 사용 (API에서 직접 취득)
-  if (type == TYPE_KSTOCK || type == TYPE_STOCK) {
-    const char* name = meta["longName"] | "";
-    if (strlen(name) > 0) {
-      strncpy(data.symbol, name, sizeof(data.symbol) - 1);
-      data.symbol[sizeof(data.symbol) - 1] = '\0';
-    }
-  }
-
-  auto closes = result["indicators"]["quote"][0]["close"];
-  int total = 0;
-  for (JsonVariant cv : closes.as<JsonArray>()) if (!cv.isNull()) total++;
-  int step = (total > MAX_CHART_POINTS) ? total / MAX_CHART_POINTS : 1;
-  int seen = 0;
-  for (JsonVariant cv : closes.as<JsonArray>()) {
-    if (cv.isNull()) continue;
-    if (seen % step == 0 && data.chartCount < MAX_CHART_POINTS) {
-      data.chart[data.chartCount++] = cv.as<float>();
-    }
-    seen++;
-  }
-
-  // change% 기준: 전일종가 우선, 없으면 첫 차트 포인트
-  float base = (data.prevClose > 0) ? data.prevClose
-             : (data.chartCount > 0) ? data.chart[0] : 0;
-  data.change = (base > 0) ? ((data.price - base) / base) * 100.0f : 0;
-  computeChartRange(data);
-
-  Serial.printf("[Yahoo] price=%.4f prevClose=%.4f change=%+.2f%% points=%d (raw %d, step %d)\n",
-                data.price, data.prevClose, data.change, data.chartCount, total, step);
-
-  http.end();
+  // 모든 시도 실패
   return data;
 }
 
