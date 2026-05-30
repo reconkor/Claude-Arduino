@@ -1773,7 +1773,7 @@ void loop() {
       currentData.change = (base > 0) ? ((newPrice - base) / base) * 100.0f : 0;
       Serial.printf("[PriceRefresh] %s → %.4f (%+.2f%%)\n",
                     yfSym.c_str(), newPrice, currentData.change);
-      drawTicker(currentData);
+      irisInTicker(currentData);
     }
     return;
   }
